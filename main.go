@@ -1,250 +1,185 @@
 package main
 
 import (
-	"encoding/binary"
-	"encoding/json"
-	"fmt"
-	"net"
+	"context"
+	"net/http"
 	"os"
-	"strconv"
-	"strings"
-	"sync"
+	"os/signal"
+	"syscall"
 	"time"
 
-	term "github.com/nsf/termbox-go"
+	"github.com/clintjedwards/innerhaven/internal/config"
+	"github.com/clintjedwards/innerhaven/internal/frontend"
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humago"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/rs/zerolog/log"
 )
 
-// plug is the representation of the keybinding and plug pairing
-type plug struct {
-	IPAddress  string
-	TriggerKey int
-	Model      string
-	Name       string
-	mtx        *sync.Mutex
-	On         bool
-	lastCmd    time.Time
+func ptr[T any](v T) *T {
+	return &v
 }
 
-// all of the structs below are just to conform to the sysinfo json result
-type system struct {
-	command `json:"system"`
+type APIContext struct {
+	config *config.API
 }
 
-type command struct {
-	info `json:"get_sysinfo"`
-}
-
-type info struct {
-	Alias           string  `json:"alias,omitempty"`
-	SoftwareVersion string  `json:"sw_veri,omitempty"`
-	HardwareVersion string  `json:"hw_ver,omitempty"`
-	Model           string  `json:"model,omitempty"`
-	DeviceID        string  `json:"deviceId,omitempty"`
-	OemID           string  `json:"oemId,omitempty"`
-	HardwareID      string  `json:"hwId,omitempty"`
-	Rssi            float64 `json:"rssi,omitempty"`
-	Longitude       float64 `json:"longitude,omitempty"`
-	Latitude        float64 `json:"latitude,omitempty"`
-	Updating        int     `json:"updating,omitempty"`
-	LEDOff          int     `json:"led_off,omitempty"`
-	RelayState      int     `json:"relay_state,omitempty"`
-	OnTime          int     `json:"on_time,omitempty"`
-	ActiveMode      string  `json:"active_mode,omitempty"`
-	IconHash        string  `json:"icon_hash,omitempty"`
-	ErrorCode       int     `json:"err_code,omitempty"`
-}
-
-func main() {
-	if len(os.Args) != 2 {
-		fmt.Println("Usage: kasa-internal <ip>:<key>,<ip>:<key>")
-		os.Exit(1)
+// NewAPI creates a new instance of the main Gofer API service.
+func NewAPI(config *config.API) (*APIContext, error) {
+	newAPI := &APIContext{
+		config: config,
 	}
 
-	err := term.Init()
+	return newAPI, nil
+}
+
+// cleanup gracefully cleans up all goroutines to ensure a clean shutdown.
+func (apictx *APIContext) cleanup() {
+}
+
+// StartAPIService starts the Gofer API service and blocks until a SIGINT or SIGTERM is received.
+func (apictx *APIContext) StartAPIService() {
+	tlsConfig, err := apictx.generateTLSConfig(apictx.config.Server.TLSCertPath, apictx.config.Server.TLSKeyPath)
 	if err != nil {
-		panic(err)
-	}
-	defer term.Close()
-
-	// mapping should be in the form: <ip addr>:<key>,<ip addr>:<key>
-	mapping := os.Args[1]
-	plugs := processMapping(mapping)
-	getSystemInfo(plugs...)
-
-	for {
-		fmt.Println("Listening for input")
-		event := term.PollEvent()
-		eventType := event.Type
-
-		if eventType != term.EventKey {
-			continue
-		}
-
-		if event.Key == term.KeyCtrlC {
-			return
-		}
-
-		for _, plug := range plugs {
-			if term.Key(plug.TriggerKey) == event.Key {
-				_ = term.Sync()
-				err := plug.toggle()
-				if err != nil {
-					fmt.Printf("could not toggle switch %s; %v", plug.Name, err)
-					continue
-				}
-
-			}
-		}
-	}
-}
-
-// This takes a long time.
-func getSystemInfo(plugs ...*plug) {
-	for _, plug := range plugs {
-		info, err := plug.systemInfo()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		plug.Name = info.Alias
-		plug.Model = info.Model
-		plug.On = int2bool(info.RelayState)
-		fmt.Printf("Found plug: %s\n", plug.Name)
-	}
-}
-
-func int2bool(r int) bool {
-	return r == 1
-}
-
-func processMapping(m string) []*plug {
-	mappingSlice := strings.Split(m, ",")
-
-	plugs := []*plug{}
-
-	for _, mapping := range mappingSlice {
-		IPKeyPair := strings.Split(mapping, ":")
-		triggerKey, err := strconv.Atoi(IPKeyPair[1])
-		if err != nil {
-			panic(err)
-		}
-		plugs = append(plugs, &plug{
-			IPAddress:  IPKeyPair[0],
-			TriggerKey: triggerKey,
-			mtx:        &sync.Mutex{},
-		})
+		log.Fatal().Err(err).Msg("could not get proper TLS config")
 	}
 
-	return plugs
-}
+	// Assign all routes and handlers
+	router, _ := InitRouter(apictx)
 
-func (p *plug) systemInfo() (system, error) {
-	payload := `{"system":{"get_sysinfo":{}}}`
-	results, err := p.sendCmd(payload)
+	httpServer := http.Server{
+		Addr:         apictx.config.Server.ListenAddress,
+		Handler:      loggingMiddleware(router),
+		WriteTimeout: apictx.config.Server.WriteTimeout,
+		ReadTimeout:  apictx.config.Server.ReadTimeout,
+		IdleTimeout:  apictx.config.Server.IdleTimeout,
+		TLSConfig:    tlsConfig,
+	}
+
+	// Run our server in a goroutine and listen for signals that indicate graceful shutdown
+	go func() {
+		if err := httpServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatal().Err(err).Msg("server exited abnormally")
+		}
+	}()
+	log.Info().Str("url", apictx.config.Server.ListenAddress).Msg("started gofer http service")
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGTERM, syscall.SIGINT)
+	<-c
+
+	// On ctrl-c we need to clean up not only the connections from the server, but make sure all the currently
+	// running jobs are logged and exited properly.
+	apictx.cleanup()
+
+	// Doesn't block if no connections, otherwise will wait until the timeout deadline or connections to finish,
+	// whichever comes first.
+	ctx, cancel := context.WithTimeout(context.Background(), apictx.config.Server.ShutdownTimeout) // shutdown gracefully
+	defer cancel()
+
+	err = httpServer.Shutdown(ctx)
 	if err != nil {
-		return system{}, err
-	}
-
-	var info system
-	err = json.Unmarshal(results, &info)
-	if err != nil {
-		return system{}, err
-	}
-
-	return info, nil
-}
-
-func (p *plug) turnOn() (err error) {
-	payload := `{"system":{"set_relay_state":{"state":1}}}`
-	_, err = p.sendCmd(payload)
-	return
-}
-
-func (p *plug) turnOff() (err error) {
-	payload := `{"system":{"set_relay_state":{"state":0}}}`
-	_, err = p.sendCmd(payload)
-	return
-}
-
-func (p *plug) toggle() (err error) {
-	if p.On {
-		err = p.turnOff()
-		p.On = false
-		fmt.Printf("Toggled: %s %s\n", p.Name, time.Now().Format("01-02 15:04:05"))
+		log.Error().Err(err).Msg("could not shutdown server in timeout specified")
 		return
 	}
 
-	err = p.turnOn()
-	p.On = true
-	fmt.Printf("Toggled: %s %s\n", p.Name, time.Now().Format("01-02 15:04:05"))
-	return
+	log.Info().Msg("http server exited gracefully")
 }
 
-// sendCmd handles the communication with the plug.
-func (p *plug) sendCmd(data string) ([]byte, error) {
-	// protect against sending too many commands at once
-	p.mtx.Lock()
-	defer func() {
-		p.lastCmd = time.Now()
-		p.mtx.Unlock()
-	}()
-	if time.Since(p.lastCmd) < time.Millisecond*500 {
-		time.Sleep(time.Millisecond * 500)
+// The logging middleware has to be run before the final call to return the request.
+// This is because we wrap the responseWriter to gain information from it after it
+// has been written to (this enables us to get things that we only know after the request has been served like status codes).
+// To speed this process up we call Serve as soon as possible and log afterwards.
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		next.ServeHTTP(ww, r)
+
+		log.Debug().Str("method", r.Method).
+			Stringer("url", r.URL).
+			Int("status_code", ww.Status()).
+			Int("response_size_bytes", ww.BytesWritten()).
+			Float64("elapsed_ms", float64(time.Since(start))/float64(time.Millisecond)).
+			Msg("")
+	})
+}
+
+// Create a new http router that gets populated by huma lib. Huma helps create an OpenAPI spec and documentation
+// from REST code. We export this function so that we can use it in external scripts to generate the OpenAPI spec
+// for this API in other places.
+func InitRouter(apictx *APIContext) (router *http.ServeMux, apiDescription huma.API) {
+	router = http.NewServeMux()
+
+	version, _ := parseVersion(appVersion)
+	humaConfig := huma.DefaultConfig("Gofer", version)
+	humaConfig.Info.Description = "Gofer is an opinionated, streamlined automation engine designed for the cloud-native " +
+		"era. It specializes in executing your custom scripts in a containerized environment, making it versatile for " +
+		"both developers and operations teams. Deploy Gofer effortlessly as a single static binary, and " +
+		"manage it using expressive, declarative configurations written in real programming languages. Once " +
+		"set up, Gofer takes care of scheduling and running your automation tasks—be it on Nomad, Kubernetes, or even Local Docker." +
+		"\n" +
+		"Its primary function is to execute short-term jobs like code linting, build automation, testing, port scanning, " +
+		"ETL operations, or any task you can containerize and trigger based on events."
+
+	humaConfig.DocsPath = "/api/docs"
+	humaConfig.OpenAPIPath = "/api/docs/openapi"
+	humaConfig.Servers = append(humaConfig.Servers, &huma.Server{
+		URL: apictx.config.Server.ListenAddress,
+	})
+	humaConfig.Components.SecuritySchemes = map[string]*huma.SecurityScheme{
+		"bearer": {
+			Type:   "http",
+			Scheme: "bearer",
+		},
 	}
 
-	res := make([]byte, 2048)
+	apiDescription = humago.New(router, humaConfig)
 
-	// connect to plug
-	conn, err := net.Dial("tcp", p.IPAddress+":9999")
+	/* /api/system */
+	apictx.registerDescribeSystemInfo(apiDescription)
+	apictx.registerDescribeSystemSummary(apiDescription)
+
+	/* /api/lights */
+	// apictx.registerCreateToken(apiDescription)
+
+	// /* /api/weather */
+	// apictx.registerDescribeTaskExecution(apiDescription)
+
+	// /* /api/transit */
+	// apictx.registerDescribeTaskExecution(apiDescription)
+
+	// Set up the frontend paths last since they capture everything that isn't in the API path.
+	if apictx.config.Development.LoadFrontendFilesFromDisk {
+		log.Warn().Msg("Loading frontend files from local disk dir 'public'; Not for use in production.")
+		router.Handle("/", frontend.LocalHandler())
+	} else {
+		router.Handle("/", frontend.StaticHandler())
+	}
+
+	if apictx.config.Development.GenerateOpenAPISpecFiles {
+		generateOpenAPIFiles(apiDescription)
+	}
+
+	return router, apiDescription
+}
+
+// Generates OpenAPI Yaml files that other services can use to generate code for Gofer's API.
+func generateOpenAPIFiles(apiDescription huma.API) {
+	output, err := apiDescription.OpenAPI().YAML()
 	if err != nil {
-		return res, fmt.Errorf("connecting to plug: %w", err)
-	}
-	defer conn.Close()
-
-	// set timeout
-	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return res, fmt.Errorf("setting timeout: %w", err)
+		panic(err)
 	}
 
-	payload := encrypt([]byte(data))
-
-	if _, err := conn.Write(payload); err != nil {
-		return res, fmt.Errorf("writing payload: %w", err)
-	}
-
-	// receive, decrypt response
-	i, err := conn.Read(res)
+	file, err := os.Create("openapi.yaml")
 	if err != nil {
-		return res, err
+		panic(err)
 	}
-	decrypted := decrypt(res[:i]) // only include the bytes that were read
-	return decrypted, nil
-}
+	defer file.Close()
 
-// encrypt follows the autokey cipher used by the HS1xx to encrypt commands.
-func encrypt(bx []byte) []byte {
-	key := 171
-	res := make([]byte, 4)
-	binary.BigEndian.PutUint32(res, uint32(len(bx))) // equivalent in python: struct.pack('>I', len(cmd))
-
-	for i := range bx {
-		b := key ^ int(bx[i])
-		key = b
-		res = append(res, byte(b))
+	_, err = file.Write(output)
+	if err != nil {
+		panic(err)
 	}
-	return res
-}
-
-// decrypt follows the autokey cipher used by the HS1xx to decrypt commands.
-func decrypt(bx []byte) []byte {
-	key := 171
-	var res []byte
-
-	for i := 4; i < len(bx); i++ { // first 4 bytes are padding
-		b := key ^ int(bx[i])
-		key = int(bx[i])
-		res = append(res, byte(b))
-	}
-	return res
 }
